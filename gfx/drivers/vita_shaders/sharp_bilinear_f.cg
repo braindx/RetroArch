@@ -1,0 +1,18 @@
+float4 main(
+	float2 texCoord : TEXCOORD0,
+	uniform sampler2D sourceTexture,
+	uniform float4 dimensions)
+{
+   float2 texelCoord = texCoord * dimensions.xy;
+   float2 texelCoordFloored = floor( texelCoord );
+   float2 texelCoordFraction = frac( texelCoord );
+   float integerScale = floor( dimensions.w / dimensions.y + 0.01 );
+   float regionRange = 0.5 - 0.5 / integerScale;
+
+   float2 centerDistance = texelCoordFraction - 0.5;
+   float2 f = ( centerDistance - clamp( centerDistance, -regionRange, regionRange ) ) * integerScale + 0.5;
+   float2 modifiedTexelCoord = texelCoordFloored + f;
+
+   float2 modifiedTexCoord = modifiedTexelCoord / dimensions.xy;
+	return tex2D(sourceTexture, modifiedTexCoord);
+}

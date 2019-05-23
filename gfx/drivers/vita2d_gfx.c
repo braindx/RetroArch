@@ -14,6 +14,9 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <psp2/gxm.h>
+#include <shared.h>
+#include <utils.h>
 #include <vita2d.h>
 
 #include <retro_inline.h>
@@ -38,14 +41,162 @@
 
 #include "../../defines/psp_defines.h"
 
+#include "vita_shaders/sharp_bilinear_v_gxp.h"
+#include "vita_shaders/sharp_bilinear_f_gxp.h"
+
+static const SceGxmProgram *const vita2d_gfx_sharp_bilinear_vertex_program_gxp = (const SceGxmProgram *const)&sharp_bilinear_v_gxp;
+static const SceGxmProgram *const vita2d_gfx_sharp_bilinear_fragment_program_gxp = (const SceGxmProgram *const)&sharp_bilinear_f_gxp;
+static SceGxmShaderPatcherId vita2d_gfx_sharp_bilinear_vertex_program_id;
+static SceGxmShaderPatcherId vita2d_gfx_sharp_bilinear_fragment_program_id;
+static SceGxmVertexProgram *vita2d_gfx_sharp_bilinear_vertex_program = NULL;
+static SceGxmFragmentProgram *vita2d_gfx_sharp_bilinear_fragment_program = NULL;
+const SceGxmProgramParameter *vita2d_gfx_sharp_bilinear_dimensions_param = NULL;
+static SceGxmShaderPatcher *vita2d_gfx_shader_patcher = NULL;
+static SceUID vita2d_gfx_shader_patcher_buffer_uid;
+static SceUID vita2d_gfx_shader_patcher_vertex_usse_uid;
+static SceUID vita2d_gfx_shader_patcher_fragment_usse_uid;
+
 extern void *memcpy_neon(void *dst, const void *src, size_t n);
 
 static void vita2d_gfx_set_viewport(void *data, unsigned viewport_width,
       unsigned viewport_height, bool force_full, bool allow_rotate);
 
+static void vita2d_load_shader_sharp_bilinear()
+{
+   int err = sceGxmProgramCheck(vita2d_gfx_sharp_bilinear_vertex_program_gxp);
+   RARCH_LOG("sharp_bilinear_v sceGxmProgramCheck(): 0x%08X\n", err);
+   err = sceGxmProgramCheck(vita2d_gfx_sharp_bilinear_fragment_program_gxp);
+   RARCH_LOG("sharp_bilinear_f sceGxmProgramCheck(): 0x%08X\n", err);
+
+   err = sceGxmShaderPatcherRegisterProgram(vita2d_gfx_shader_patcher, vita2d_gfx_sharp_bilinear_vertex_program_gxp, &vita2d_gfx_sharp_bilinear_vertex_program_id);
+	RARCH_LOG("sharp_bilinear_v sceGxmShaderPatcherRegisterProgram(): 0x%08X\n", err);
+   err = sceGxmShaderPatcherRegisterProgram(vita2d_gfx_shader_patcher, vita2d_gfx_sharp_bilinear_fragment_program_gxp, &vita2d_gfx_sharp_bilinear_fragment_program_id);
+	RARCH_LOG("sharp_bilinear_f sceGxmShaderPatcherRegisterProgram(): 0x%08X\n", err);
+
+   const SceGxmProgramParameter *paramInPositionAttribute = sceGxmProgramFindParameterByName(vita2d_gfx_sharp_bilinear_vertex_program_gxp, "inPosition");
+	RARCH_LOG("sharp_bilinear_v inPosition sceGxmProgramFindParameterByName(): %p\n", paramInPositionAttribute);
+   const SceGxmProgramParameter *paramInTexCoordAttribute = sceGxmProgramFindParameterByName(vita2d_gfx_sharp_bilinear_vertex_program_gxp, "inTexCoord");
+	RARCH_LOG("sharp_bilinear_v inTexCoord sceGxmProgramFindParameterByName(): %p\n", paramInTexCoordAttribute);
+
+   // create texture vertex format
+	SceGxmVertexAttribute vertexAttributes[2];
+	SceGxmVertexStream vertexStreams[1];
+	/* x,y,z: 3 float 32 bits */
+	vertexAttributes[0].streamIndex = 0;
+	vertexAttributes[0].offset = 0;
+	vertexAttributes[0].format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+	vertexAttributes[0].componentCount = 3; // (x, y, z)
+	vertexAttributes[0].regIndex = sceGxmProgramParameterGetResourceIndex(paramInPositionAttribute);
+	/* u,v: 2 floats 32 bits */
+	vertexAttributes[1].streamIndex = 0;
+	vertexAttributes[1].offset = 12; // (x, y, z) * 4 = 12 bytes
+	vertexAttributes[1].format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+	vertexAttributes[1].componentCount = 2; // (u, v)
+	vertexAttributes[1].regIndex = sceGxmProgramParameterGetResourceIndex(paramInTexCoordAttribute);
+	// 16 bit (short) indices
+	vertexStreams[0].stride = sizeof(vita2d_texture_vertex);
+	vertexStreams[0].indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
+
+   err = sceGxmShaderPatcherCreateVertexProgram(
+		vita2d_gfx_shader_patcher,
+		vita2d_gfx_sharp_bilinear_vertex_program_id,
+		vertexAttributes,
+		2,
+		vertexStreams,
+		1,
+		&vita2d_gfx_sharp_bilinear_vertex_program);
+	RARCH_LOG("sharp_bilinear_v sceGxmShaderPatcherCreateVertexProgram(): 0x%08X\n", err);
+
+   const SceGxmBlendInfo blend_info = {
+		.colorFunc = SCE_GXM_BLEND_FUNC_ADD,
+		.alphaFunc = SCE_GXM_BLEND_FUNC_ADD,
+		.colorSrc  = SCE_GXM_BLEND_FACTOR_SRC_ALPHA,
+		.colorDst  = SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+		.alphaSrc  = SCE_GXM_BLEND_FACTOR_ONE,
+		.alphaDst  = SCE_GXM_BLEND_FACTOR_ZERO,
+		.colorMask = SCE_GXM_COLOR_MASK_ALL
+	};
+   err = sceGxmShaderPatcherCreateFragmentProgram(
+		vita2d_gfx_shader_patcher,
+		vita2d_gfx_sharp_bilinear_fragment_program_id,
+		SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+		SCE_GXM_MULTISAMPLE_NONE,
+		&blend_info,
+		vita2d_gfx_sharp_bilinear_vertex_program_gxp,
+		&vita2d_gfx_sharp_bilinear_fragment_program);
+	RARCH_LOG("sharp_bilinear_f sceGxmShaderPatcherCreateFragmentProgram(): 0x%08X\n", err);
+
+   vita2d_gfx_sharp_bilinear_dimensions_param = sceGxmProgramFindParameterByName(vita2d_gfx_sharp_bilinear_fragment_program_gxp, "dimensions");
+	RARCH_LOG("sharp_bilinear_f dimensions sceGxmProgramFindParameterByName(): %p\n", vita2d_gfx_sharp_bilinear_dimensions_param);
+}
+
+static void *vita2d_gfx_shader_patcher_host_alloc(void *user_data, unsigned int size)
+{
+	return malloc(size);
+}
+
+static void vita2d_gfx_shader_patcher_host_free(void *user_data, void *mem)
+{
+	free(mem);
+}
+
+static void vita2d_load_shaders()
+{
+   const unsigned int patcherBufferSize		= 64*1024;
+	const unsigned int patcherVertexUsseSize	= 64*1024;
+	const unsigned int patcherFragmentUsseSize	= 64*1024;
+
+	// allocate memory for buffers and USSE code
+	void *patcherBuffer = gpu_alloc(
+		SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE,
+		patcherBufferSize,
+		4,
+		SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE,
+		&vita2d_gfx_shader_patcher_buffer_uid);
+
+	unsigned int patcherVertexUsseOffset;
+	void *patcherVertexUsse = vertex_usse_alloc(
+		patcherVertexUsseSize,
+		&vita2d_gfx_shader_patcher_vertex_usse_uid,
+		&patcherVertexUsseOffset);
+
+	unsigned int patcherFragmentUsseOffset;
+	void *patcherFragmentUsse = fragment_usse_alloc(
+		patcherFragmentUsseSize,
+		&vita2d_gfx_shader_patcher_fragment_usse_uid,
+		&patcherFragmentUsseOffset);
+
+	// create a shader patcher
+	SceGxmShaderPatcherParams patcherParams;
+	memset(&patcherParams, 0, sizeof(SceGxmShaderPatcherParams));
+	patcherParams.userData			= NULL;
+	patcherParams.hostAllocCallback		= &vita2d_gfx_shader_patcher_host_alloc;
+	patcherParams.hostFreeCallback		= &vita2d_gfx_shader_patcher_host_free;
+	patcherParams.bufferAllocCallback	= NULL;
+	patcherParams.bufferFreeCallback	= NULL;
+	patcherParams.bufferMem			= patcherBuffer;
+	patcherParams.bufferMemSize		= patcherBufferSize;
+	patcherParams.vertexUsseAllocCallback	= NULL;
+	patcherParams.vertexUsseFreeCallback	= NULL;
+	patcherParams.vertexUsseMem		= patcherVertexUsse;
+	patcherParams.vertexUsseMemSize		= patcherVertexUsseSize;
+	patcherParams.vertexUsseOffset		= patcherVertexUsseOffset;
+	patcherParams.fragmentUsseAllocCallback	= NULL;
+	patcherParams.fragmentUsseFreeCallback	= NULL;
+	patcherParams.fragmentUsseMem		= patcherFragmentUsse;
+	patcherParams.fragmentUsseMemSize	= patcherFragmentUsseSize;
+	patcherParams.fragmentUsseOffset	= patcherFragmentUsseOffset;
+
+	int err = sceGxmShaderPatcherCreate(&patcherParams, &vita2d_gfx_shader_patcher);
+	RARCH_LOG("sceGxmShaderPatcherCreate(): 0x%08X\n", err);
+
+   vita2d_load_shader_sharp_bilinear();
+}
+
 static void *vita2d_gfx_init(const video_info_t *video,
       const input_driver_t **input, void **input_data)
 {
+   settings_t *settings = config_get_ptr();
    vita_video_t *vita   = (vita_video_t *)calloc(1, sizeof(vita_video_t));
    unsigned temp_width                = PSP_FB_WIDTH;
    unsigned temp_height               = PSP_FB_HEIGHT;
@@ -94,7 +245,6 @@ static void *vita2d_gfx_init(const video_info_t *video,
 
    if (input && input_data)
    {
-      settings_t *settings = config_get_ptr();
       void *pspinput       = input_psp.init(settings->arrays.input_joypad_driver);
       *input               = pspinput ? &input_psp : NULL;
       *input_data          = pspinput;
@@ -108,6 +258,8 @@ static void *vita2d_gfx_init(const video_info_t *video,
    font_driver_init_osd(vita, false,
          video->is_threaded,
          FONT_DRIVER_RENDER_VITA2D);
+
+   vita2d_load_shaders();
 
    return vita;
 }
@@ -130,6 +282,87 @@ static void vita2d_free_overlay(vita_video_t *vita)
 
 static void vita2d_gfx_update_viewport(vita_video_t* vita,
       video_frame_info_t *video_info);
+
+static void vita2d_gfx_draw_texture(vita_video_t *vita, float destX, float destY, float destWidth, float destHeight, float radians)
+{
+   if (vita->tex_filter != SCE_GXM_TEXTURE_FILTER_LINEAR)
+   {
+      vita2d_draw_texture_scale_rotate(vita->texture, destX, destY, destWidth, destHeight, radians);
+      return;
+   }
+
+   sceGxmSetVertexProgram(_vita2d_context, vita2d_gfx_sharp_bilinear_vertex_program);
+   sceGxmSetFragmentProgram(_vita2d_context, vita2d_gfx_sharp_bilinear_fragment_program);
+
+   void *dimensions_buffer;
+   int err = sceGxmReserveFragmentDefaultUniformBuffer(_vita2d_context, &dimensions_buffer);
+   float *dimensions = vita2d_pool_memalign(
+      4 * sizeof(float), // RGBA
+      sizeof(float));
+   dimensions[0] = (float)vita->width;
+   dimensions[1] = (float)vita->height;
+   dimensions[2] = destWidth;
+   dimensions[3] = destHeight;
+   err = sceGxmSetUniformDataF(dimensions_buffer, vita2d_gfx_sharp_bilinear_dimensions_param, 0, 4, dimensions);
+
+   vita2d_texture_vertex *vertices = (vita2d_texture_vertex *)vita2d_pool_memalign(
+      4 * sizeof(vita2d_texture_vertex), // 4 vertices
+      sizeof(vita2d_texture_vertex));
+
+   uint16_t *indices = (uint16_t *)vita2d_pool_memalign(
+      4 * sizeof(uint16_t), // 4 indices
+      sizeof(uint16_t));
+
+   vertices[0].x = destX;
+   vertices[0].y = destY+destHeight;
+   vertices[0].z = 0.0f;
+   vertices[0].u = 0.0f;
+   vertices[0].v = 0.0f;
+
+   vertices[1].x = destX+destWidth;
+   vertices[1].y = destY+destHeight;
+   vertices[1].z = 0.0f;
+   vertices[1].u = 1.0f;
+   vertices[1].v = 0.0f;
+
+   vertices[2].x = destX;
+   vertices[2].y = destY;
+   vertices[2].z = 0.0f;
+   vertices[2].u = 0.0f;
+   vertices[2].v = 1.0f;
+
+   vertices[3].x = destX+destWidth;
+   vertices[3].y = destY;
+   vertices[3].z = 0.0f;
+   vertices[3].u = 1.0f;
+   vertices[3].v = 1.0f;
+
+   indices[0] = 0;
+   indices[1] = 1;
+   indices[2] = 2;
+   indices[3] = 3;
+
+   float centerX = destX + destWidth/2.0f;
+   float centerY = destY + destHeight/2.0f;
+   float c = cosf(radians);
+	float s = sinf(radians);
+   int i;
+   for (i = 0; i < 4; ++i)
+   {
+		float xFromCenter = vertices[i].x-centerX;
+		float yFromCenter = vertices[i].y-centerY;
+      float rotatedX = xFromCenter*c - yFromCenter*s + centerX;
+      float rotatedY = xFromCenter*s + yFromCenter*c + centerY;
+      vertices[i].x = -1.0f + 2.0f * rotatedX / PSP_FB_WIDTH;
+      vertices[i].y = -1.0f + 2.0f * rotatedY / PSP_FB_HEIGHT;
+	}
+
+   // Set the texture to the TEXUNIT0
+   sceGxmSetFragmentTexture(_vita2d_context, 0, &vita->texture->gxm_tex);
+
+   sceGxmSetVertexStream(_vita2d_context, 0, vertices);
+   sceGxmDraw(_vita2d_context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, indices, 4);
+}
 
 static bool vita2d_gfx_frame(void *data, const void *frame,
       unsigned width, unsigned height, uint64_t frame_count,
@@ -195,18 +428,13 @@ static bool vita2d_gfx_frame(void *data, const void *frame,
    if (vita->texture)
    {
       if (vita->fullscreen)
-         vita2d_draw_texture_scale(vita->texture,
-               0, 0,
-               PSP_FB_WIDTH  / (float)vita->width,
-               PSP_FB_HEIGHT / (float)vita->height);
+      {
+         vita2d_gfx_draw_texture(vita, 0.0f, 0.0f, PSP_FB_WIDTH, PSP_FB_HEIGHT, 0.0f);
+      }
       else
       {
-         const float radian = 90 * 0.0174532925f;
-         const float rad = vita->rotation * radian;
-         float scalex = vita->vp.width / (float)vita->width;
-         float scaley = vita->vp.height / (float)vita->height;
-         vita2d_draw_texture_scale_rotate(vita->texture,vita->vp.x,
-               vita->vp.y, scalex, scaley, rad);
+         const float rad = vita->rotation * M_PI / 180.0f;
+         vita2d_gfx_draw_texture(vita, vita->vp.x, vita->vp.y, vita->vp.width, vita->vp.height, rad);
       }
    }
 
@@ -303,6 +531,16 @@ static bool vita2d_gfx_suppress_screensaver(void *data, bool enable)
 static void vita2d_gfx_free(void *data)
 {
    vita_video_t *vita = (vita_video_t *)data;
+
+   sceGxmFinish(_vita2d_context);
+   sceGxmShaderPatcherReleaseFragmentProgram(vita2d_gfx_shader_patcher, vita2d_gfx_sharp_bilinear_fragment_program);
+   sceGxmShaderPatcherReleaseVertexProgram(vita2d_gfx_shader_patcher, vita2d_gfx_sharp_bilinear_vertex_program);
+   sceGxmShaderPatcherUnregisterProgram(vita2d_gfx_shader_patcher, vita2d_gfx_sharp_bilinear_fragment_program_id);
+   sceGxmShaderPatcherUnregisterProgram(vita2d_gfx_shader_patcher, vita2d_gfx_sharp_bilinear_vertex_program_id);
+   sceGxmShaderPatcherDestroy(vita2d_gfx_shader_patcher);
+   fragment_usse_free(vita2d_gfx_shader_patcher_fragment_usse_uid);
+	vertex_usse_free(vita2d_gfx_shader_patcher_vertex_usse_uid);
+	gpu_free(vita2d_gfx_shader_patcher_buffer_uid);
 
    vita2d_fini();
 

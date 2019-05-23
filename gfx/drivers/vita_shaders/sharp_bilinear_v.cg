@@ -1,0 +1,9 @@
+﻿void main(
+	float3 inPosition,
+	float2 inTexCoord,
+	float4 out outPosition : POSITION,
+	float2 out outTexCoord : TEXCOORD0)
+{
+	outPosition = float4(inPosition, 1.0f);
+	outTexCoord = inTexCoord;
+}
